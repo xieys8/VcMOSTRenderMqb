@@ -1,3 +1,5 @@
+// vnc_qnx_pipelined.cpp
+
 #include <cstdlib>
 #include <iostream>
 #include <stdio.h>
@@ -9,25 +11,26 @@
 #include <regex.h>
 #include <GLES2/gl2.h>
 #include <EGL/egl.h>
-#include <dlfcn.h>   // for dynamic loading functions such as dlopen, 	lsym, and dlclose
-#include <iostream>
+#include <dlfcn.h>
 #include <string>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
-#include <time.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
 #include "miniz.h"
+
 #include <unistd.h>
 #include <sys/time.h>
+#include <stdint.h>
+#include <errno.h>
 
 #include <netinet/tcp.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <sys/sysctl.h>
 #include <sys/param.h>
 #include <netinet/tcp_var.h>
@@ -36,7 +39,63 @@
 #define TCP_USER_TIMEOUT 18  // how long for loss retry before timeout [ms]
 #endif
 
-//GLES setup
+// ---------------- Timing (C++98-friendly) ----------------
+struct FrameTimings {
+    double recv_ms;
+    double inflate_ms;
+    double parse_ms;
+    double texture_upload_ms;
+    double total_frame_ms;
+    FrameTimings() : recv_ms(0.0), inflate_ms(0.0), parse_ms(0.0), texture_upload_ms(0.0), total_frame_ms(0.0) {}
+};
+
+static uint64_t now_us()
+{
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000ULL);
+    }
+#endif
+    // Fallback
+    struct timeval tv;
+    gettimeofday(&tv, 0);
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+static double us_to_ms(uint64_t us) { return (double)us / 1000.0; }
+
+static ssize_t recv_timed(int sockfd, void* buf, size_t len, int flags, FrameTimings* timings)
+{
+    uint64_t t0 = now_us();
+    ssize_t r = recv(sockfd, buf, len, flags);
+    uint64_t t1 = now_us();
+    if (timings) timings->recv_ms += us_to_ms(t1 - t0);
+    return r;
+}
+
+// recv until exactly len bytes read, or fail (timeout / disconnect / error)
+static int recv_exact(int sockfd, void* buf, size_t len, FrameTimings* timings)
+{
+    size_t off = 0;
+    char* p = (char*)buf;
+
+    while (off < len) {
+        ssize_t r = recv_timed(sockfd, p + off, len - off, 0, timings);
+        if (r == 0) {
+            // peer closed
+            errno = ECONNRESET;
+            return -1;
+        }
+        if (r < 0) {
+            return -1;
+        }
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+// ---------------- GLES setup ----------------
 GLuint programObject;
 GLuint programObjectTextRender;
 EGLDisplay eglDisplay;
@@ -44,542 +103,284 @@ EGLConfig eglConfig;
 EGLSurface eglSurface;
 EGLContext eglContext;
 
-// VNC shaders
-// Vertex shader source
-const char* vertexShaderSource = "attribute vec2 position;    \n"
-	"attribute vec2 texCoord;     \n" // Add texture coordinate attribute
-		"varying vec2 v_texCoord;     \n" // Declare varying variable for texture coordinate
-		"void main()                  \n"
-		"{                            \n"
-		"   gl_Position = vec4(position, 0.0, 1.0); \n"
-		"   v_texCoord = texCoord;   \n"
-		"   gl_PointSize = 4.0;      \n" // Point size
-		"}                            \n";
+// ---------------- VNC shaders ----------------
+const char* vertexShaderSource =
+    "attribute vec2 position;    \n"
+    "attribute vec2 texCoord;     \n"
+    "varying vec2 v_texCoord;     \n"
+    "void main()                  \n"
+    "{                            \n"
+    "   gl_Position = vec4(position, 0.0, 1.0); \n"
+    "   v_texCoord = texCoord;   \n"
+    "   gl_PointSize = 4.0;      \n"
+    "}                            \n";
 
-const char* fragmentShaderSource = "precision mediump float;\n"
-	"varying vec2 v_texCoord;\n"
-	"uniform sampler2D texture;\n"
-	"void main()\n"
-	"{\n"
-	"    gl_FragColor = texture2D(texture, v_texCoord);\n"
-	"}\n";
+const char* fragmentShaderSource =
+    "precision mediump float;\n"
+    "varying vec2 v_texCoord;\n"
+    "uniform sampler2D texture;\n"
+    "void main()\n"
+    "{\n"
+    "    gl_FragColor = texture2D(texture, v_texCoord);\n"
+    "}\n";
 
 // Text Rendering shaders
-const char* vertexShaderSourceText = "attribute vec2 position;    \n"
-	"void main()                  \n"
-	"{                            \n"
-	"   gl_Position = vec4(position, 0.0, 1.0); \n"
-	"   gl_PointSize = 1.0;      \n" // Point size
-		"}                            \n";
+const char* vertexShaderSourceText =
+    "attribute vec2 position;    \n"
+    "void main()                  \n"
+    "{                            \n"
+    "   gl_Position = vec4(position, 0.0, 1.0); \n"
+    "   gl_PointSize = 1.0;      \n"
+    "}                            \n";
 
-// Fragment shader source
-const char* fragmentShaderSourceText = "precision mediump float;\n"
-	"void main()               \n"
-	"{                         \n"
-	"  gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); \n" // Color
-		"}                         \n";
+const char* fragmentShaderSourceText =
+    "precision mediump float;\n"
+    "void main()               \n"
+    "{                         \n"
+    "  gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); \n"
+    "}                         \n";
 
-GLfloat landscapeVertices[] = { -0.8f, 0.73, 0.0f, // Top Left
-		0.8f, 0.73f, 0.0f, // Top Right
-		0.8f, -0.63f, 0.0f, // Bottom Right
-		-0.8f, -0.63f, 0.0f // Bottom Left
-		};
-GLfloat portraitVertices[] = { -0.8f, 1.0f, 0.0f, // Top Left
-		0.8f, 1.0f, 0.0f, // Top Right
-		0.8f, -0.67f, 0.0f, // Bottom Right
-		-0.8f, -0.67f, 0.0f // Bottom Left
-		};
-// Texture coordinates
-GLfloat landscapeTexCoords[] = { 0.0f, 0.07f, // Bottom Left
-		0.90f, 0.07f, // Bottom Right
-		0.90f, 1.0f, // Top Right
-		0.0f, 1.0f // Top Left
-		};
-// Texture coordinates
-GLfloat portraitTexCoords[] = { 0.0f, 0.0f, // Bottom Left
-		0.63f, 0.0f, // Bottom Right
-		0.63f, 0.3f, // Top Right
-		0.0f, 0.3f // Top Left
-		};
+// Geometry
+GLfloat landscapeVertices[] = {
+    -0.8f,  0.73f, 0.0f,
+     0.8f,  0.73f, 0.0f,
+     0.8f, -0.63f, 0.0f,
+    -0.8f, -0.63f, 0.0f
+};
+GLfloat portraitVertices[] = {
+    -0.8f,  1.0f, 0.0f,
+     0.8f,  1.0f, 0.0f,
+     0.8f, -0.67f,0.0f,
+    -0.8f, -0.67f,0.0f
+};
+GLfloat landscapeTexCoords[] = {
+    0.0f, 0.07f,
+    0.90f,0.07f,
+    0.90f,1.0f,
+    0.0f, 1.0f
+};
+GLfloat portraitTexCoords[] = {
+    0.0f, 0.0f,
+    0.63f,0.0f,
+    0.63f,0.3f,
+    0.0f, 0.3f
+};
 
 // Constants for VNC protocol
-const char* PROTOCOL_VERSION = "RFB 003.003\n"; // Client initialization message
-const char FRAMEBUFFER_UPDATE_REQUEST[] = { 3, 0, 0, 0, 0, 0, 255, 255, 255,
-		255 };
+const char* PROTOCOL_VERSION = "RFB 003.003\n";
+const char FRAMEBUFFER_UPDATE_REQUEST[] = { 3, 0, 0, 0, 0, 0, (char)0xFF, (char)0xFF, (char)0xFF, (char)0xFF };
 const char CLIENT_INIT[] = { 1 };
 const char ZLIB_ENCODING[] = { 2, 0, 0, 2, 0, 0, 0, 6, 0, 0, 0, 0 };
 
-// SETUP SECTION
-int windowWidth = 800;
+// SETUP
+int windowWidth  = 800;
 int windowHeight = 480;
 
 const char* VNC_SERVER_IP_ADDRESS = "10.173.189.62";
-const int VNC_SERVER_PORT = 5900;
+const int   VNC_SERVER_PORT       = 5900;
 
 const char* EXLAP_SERVER_IP_ADDRESS = "127.0.0.1";
-const int EXLAP_SERVER_PORT = 25010;
+const int   EXLAP_SERVER_PORT       = 25010;
 
-// QNX SPECIFIC SECTION
+// ---------------- QNX EGL helper ----------------
 static EGLenum checkErrorEGL(const char* msg) {
-	static const char
-			* errmsg[] = {
-					"EGL function succeeded",
-					"EGL is not initialized, or could not be initialized, for the specified display",
-					"EGL cannot access a requested resource",
-					"EGL failed to allocate resources for the requested operation",
-					"EGL fail to access an unrecognized attribute or attribute value was passed in an attribute list",
-					"EGLConfig argument does not name a valid EGLConfig",
-					"EGLContext argument does not name a valid EGLContext",
-					"EGL current surface of the calling thread is no longer valid",
-					"EGLDisplay argument does not name a valid EGLDisplay",
-					"EGL arguments are inconsistent",
-					"EGLNativePixmapType argument does not refer to a valid native pixmap",
-					"EGLNativeWindowType argument does not refer to a valid native window",
-					"EGL one or more argument values are invalid",
-					"EGLSurface argument does not name a valid surface configured for rendering",
-					"EGL power management event has occurred", };
-	EGLenum error = eglGetError();
-	fprintf(stderr, "%s: %s\n", msg, errmsg[error - EGL_SUCCESS]);
-	return error;
+    static const char* errmsg[] = {
+        "EGL function succeeded",
+        "EGL is not initialized, or could not be initialized, for the specified display",
+        "EGL cannot access a requested resource",
+        "EGL failed to allocate resources for the requested operation",
+        "EGL fail to access an unrecognized attribute or attribute value was passed in an attribute list",
+        "EGLConfig argument does not name a valid EGLConfig",
+        "EGLContext argument does not name a valid EGLContext",
+        "EGL current surface of the calling thread is no longer valid",
+        "EGLDisplay argument does not name a valid EGLDisplay",
+        "EGL arguments are inconsistent",
+        "EGLNativePixmapType argument does not refer to a valid native pixmap",
+        "EGLNativeWindowType argument does not refer to a valid native window",
+        "EGL one or more argument values are invalid",
+        "EGLSurface argument does not name a valid surface configured for rendering",
+        "EGL power management event has occurred",
+    };
+    EGLenum error = eglGetError();
+    if (error >= EGL_SUCCESS && error <= EGL_CONTEXT_LOST) {
+        fprintf(stderr, "%s: %s\n", msg, errmsg[error - EGL_SUCCESS]);
+    } else {
+        fprintf(stderr, "%s: EGL error 0x%x\n", msg, (unsigned)error);
+    }
+    return error;
 }
 
 struct Command {
-	const char* command;
-	const char* error_message;
+    const char* command;
+    const char* error_message;
 };
 
-// CODE FROM HERE IS THE SAME FOR WINDOWS OR QNX
 void execute_initial_commands() {
-	struct Command commands[] = { { "/eso/bin/apps/dmdt dc 70 3",
-			"Create new display table with context 3 failed with error" }, {
-			"/eso/bin/apps/dmdt sc 4 70",
-			"Set display 4 (VC) to display table 99 failed with error" } };
-	size_t num_commands = sizeof(commands) / sizeof(commands[0]);
+    struct Command commands[] = {
+        { "/eso/bin/apps/dmdt dc 70 3",  "Create new display table with context 3 failed with error" },
+        { "/eso/bin/apps/dmdt sc 4 70",  "Set display 4 (VC) to display table 99 failed with error" }
+    };
+    size_t num_commands = sizeof(commands) / sizeof(commands[0]);
 
-	for (size_t i = 0; i < num_commands; ++i) {
-		const char* command = commands[i].command;
-		const char* error_message = commands[i].error_message;
-		printf("Executing '%s'\n", command);
-
-		// Execute the command
-		int ret = system(command);
-		if (ret != 0) {
-			fprintf(stderr, "%s: %d\n", error_message, ret);
-		}
-	}
+    for (size_t i = 0; i < num_commands; ++i) {
+        printf("Executing '%s'\n", commands[i].command);
+        int ret = system(commands[i].command);
+        if (ret != 0) fprintf(stderr, "%s: %d\n", commands[i].error_message, ret);
+    }
 }
 
 void execute_final_commands() {
-	struct Command commands[] = { { "/eso/bin/apps/dmdt dc 70 33",
-			"Create new display table with context 3 failed with error" }, {
-			"/eso/bin/apps/dmdt sc 4 70",
-			"Set display 4 (VC) to display table 99 failed with error" } };
-	size_t num_commands = sizeof(commands) / sizeof(commands[0]);
+    struct Command commands[] = {
+        { "/eso/bin/apps/dmdt dc 70 33", "Create new display table with context 3 failed with error" },
+        { "/eso/bin/apps/dmdt sc 4 70",  "Set display 4 (VC) to display table 99 failed with error" }
+    };
+    size_t num_commands = sizeof(commands) / sizeof(commands[0]);
 
-	for (size_t i = 0; i < num_commands; ++i) {
-		const char* command = commands[i].command;
-		const char* error_message = commands[i].error_message;
-		printf("Executing '%s'\n", command);
-
-		// Execute the command
-		int ret = system(command);
-		if (ret != 0) {
-			fprintf(stderr, "%s: %d\n", error_message, ret);
-		}
-	}
-}
-
-std::string readPersistanceData(const std::string& position) {
-	std::string command = "";
-#ifdef _WIN32
-	return "NC"; // not connected
-#else
-	command = "on -f mmx /net/mmx/mnt/app/eso/bin/apps/pc " + position;
-#endif
-
-	FILE* pipe = popen(command.c_str(), "r");
-	if (!pipe) {
-		std::cerr << "Error: Failed to execute command." << std::endl;
-		return "0";
-	}
-
-	char buffer[128];
-	std::string result = "";
-	while (!feof(pipe)) {
-		if (fgets(buffer, 128, pipe) != NULL)
-			result += buffer;
-	}
-	pclose(pipe);
-
-	std::cout << result;
-	return result;
+    for (size_t i = 0; i < num_commands; ++i) {
+        printf("Executing '%s'\n", commands[i].command);
+        int ret = system(commands[i].command);
+        if (ret != 0) fprintf(stderr, "%s: %d\n", commands[i].error_message, ret);
+    }
 }
 
 int16_t byteArrayToInt16(const char* byteArray) {
-	return ((int16_t) (byteArray[0] & 0xFF) << 8) | (byteArray[1] & 0xFF);
+    return (int16_t)(((unsigned char)byteArray[0] << 8) | (unsigned char)byteArray[1]);
 }
 
 int32_t byteArrayToInt32(const char* byteArray) {
-	return ((int32_t) (byteArray[0] & 0xFF) << 24) | ((int32_t) (byteArray[1]
-			& 0xFF) << 16) | ((int32_t) (byteArray[2] & 0xFF) << 8)
-			| (byteArray[3] & 0xFF);
+    return (int32_t)(
+        ((uint32_t)(unsigned char)byteArray[0] << 24) |
+        ((uint32_t)(unsigned char)byteArray[1] << 16) |
+        ((uint32_t)(unsigned char)byteArray[2] <<  8) |
+        ((uint32_t)(unsigned char)byteArray[3]      )
+    );
 }
 
-// Initialize OpenGL ES
+// ---------------- GL init ----------------
+static void compile_check(GLuint shader, const char* tag)
+{
+    GLint ok = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char infoLog[512];
+        glGetShaderInfoLog(shader, 512, NULL, infoLog);
+        printf("%s compile failed: %s\n", tag, infoLog);
+    }
+}
+
+static void link_check(GLuint prog, const char* tag)
+{
+    GLint ok = GL_FALSE;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char infoLog[512];
+        glGetProgramInfoLog(prog, 512, NULL, infoLog);
+        printf("%s link failed: %s\n", tag, infoLog);
+    }
+}
+
 void Init() {
-	// Load and compile VNC shaders
-	GLuint vertexShaderVncRender = glCreateShader(GL_VERTEX_SHADER);
-	glShaderSource(vertexShaderVncRender, 1, &vertexShaderSource, NULL);
-	glCompileShader(vertexShaderVncRender);
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &vertexShaderSource, NULL);
+    glCompileShader(vs);
+    compile_check(vs, "VNC VS");
 
-	// Check for compile errors
-	GLint vertexShaderCompileStatus;
-	glGetShaderiv(vertexShaderVncRender, GL_COMPILE_STATUS,
-			&vertexShaderCompileStatus);
-	if (vertexShaderCompileStatus != GL_TRUE) {
-		char infoLog[512];
-		glGetShaderInfoLog(vertexShaderVncRender, 512, NULL, infoLog);
-		printf("Vertex shader compilation failed: %s\n", infoLog);
-	}
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &fragmentShaderSource, NULL);
+    glCompileShader(fs);
+    compile_check(fs, "VNC FS");
 
-	GLuint fragmentShaderVncRender = glCreateShader(GL_FRAGMENT_SHADER);
-	glShaderSource(fragmentShaderVncRender, 1, &fragmentShaderSource, NULL);
-	glCompileShader(fragmentShaderVncRender);
+    GLuint vsT = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vsT, 1, &vertexShaderSourceText, NULL);
+    glCompileShader(vsT);
+    compile_check(vsT, "TXT VS");
 
-	// Check for compile errors
-	GLint fragmentShaderCompileStatus;
-	glGetShaderiv(fragmentShaderVncRender, GL_COMPILE_STATUS,
-			&fragmentShaderCompileStatus);
-	if (fragmentShaderCompileStatus != GL_TRUE) {
-		char infoLog[512];
-		glGetShaderInfoLog(fragmentShaderVncRender, 512, NULL, infoLog);
-		printf("Fragment shader compilation failed: %s\n", infoLog);
-	}
+    GLuint fsT = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fsT, 1, &fragmentShaderSourceText, NULL);
+    glCompileShader(fsT);
+    compile_check(fsT, "TXT FS");
 
-	// Load and compile Text Render shaders
-	GLuint vertexShaderTextRender = glCreateShader(GL_VERTEX_SHADER);
-	glShaderSource(vertexShaderTextRender, 1, &vertexShaderSourceText, NULL);
-	glCompileShader(vertexShaderTextRender);
+    programObject = glCreateProgram();
+    glAttachShader(programObject, vs);
+    glAttachShader(programObject, fs);
+    glLinkProgram(programObject);
+    link_check(programObject, "VNC PROG");
 
-	// Check for compile errors
-	GLint vertexShaderTextRenderCompileStatus;
-	glGetShaderiv(vertexShaderTextRender, GL_COMPILE_STATUS,
-			&vertexShaderTextRenderCompileStatus);
-	if (vertexShaderTextRenderCompileStatus != GL_TRUE) {
-		char infoLog[512];
-		glGetShaderInfoLog(vertexShaderTextRender, 512, NULL, infoLog);
-		printf("Vertex shader compilation failed: %s\n", infoLog);
-	}
+    programObjectTextRender = glCreateProgram();
+    glAttachShader(programObjectTextRender, vsT);
+    glAttachShader(programObjectTextRender, fsT);
+    glLinkProgram(programObjectTextRender);
+    link_check(programObjectTextRender, "TXT PROG");
 
-	GLuint fragmentShaderTextRender = glCreateShader(GL_FRAGMENT_SHADER);
-	glShaderSource(fragmentShaderTextRender, 1, &fragmentShaderSourceText, NULL);
-	glCompileShader(fragmentShaderTextRender);
-
-	// Check for compile errors
-	GLint fragmentShaderCompileStatusTextRender;
-	glGetShaderiv(fragmentShaderTextRender, GL_COMPILE_STATUS,
-			&fragmentShaderCompileStatusTextRender);
-	if (fragmentShaderCompileStatus != GL_TRUE) {
-		char infoLog[512];
-		glGetShaderInfoLog(fragmentShaderTextRender, 512, NULL, infoLog);
-		printf("Fragment shader compilation failed: %s\n", infoLog);
-	}
-
-	// Create program object
-	programObject = glCreateProgram();
-
-	glAttachShader(programObject, vertexShaderVncRender);
-	glAttachShader(programObject, fragmentShaderVncRender);
-	glLinkProgram(programObject);
-
-	programObjectTextRender = glCreateProgram();
-	glAttachShader(programObjectTextRender, vertexShaderTextRender);
-	glAttachShader(programObjectTextRender, fragmentShaderTextRender);
-	glLinkProgram(programObjectTextRender);
-
-	// Check for linking errors
-	GLint programLinkStatus;
-	glGetProgramiv(programObject, GL_LINK_STATUS, &programLinkStatus);
-	if (programLinkStatus != GL_TRUE) {
-		char infoLog[512];
-		glGetProgramInfoLog(programObject, 512, NULL, infoLog);
-		printf("Program linking failed: %s\n", infoLog);
-	}
-
-	glGetProgramiv(programObjectTextRender, GL_LINK_STATUS, &programLinkStatus);
-	if (programLinkStatus != GL_TRUE) {
-		char infoLog[512];
-		glGetProgramInfoLog(programObjectTextRender, 512, NULL, infoLog);
-		printf("Program linking failed: %s\n", infoLog);
-	}
-
-	// Set clear color to black
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-
+    glClearColor(0.f, 0.f, 0.f, 1.f);
 }
 
-char* parseFramebufferUpdate(int socket_fd, int* frameBufferWidth,
-		int* frameBufferHeight, z_stream strm, int* finalHeight) {
-	// Read message-type (1 byte) - not used, assuming it's always 0
-	// Message type
-	char messageType[1];
-	if (!recv(socket_fd, messageType, 1, MSG_WAITALL)) {
-		if (errno == EWOULDBLOCK || errno == EAGAIN) {
-			std::cerr << "Receive timeout occurred while reading message type"
-					<< std::endl;
-		} else {
-			std::cerr << "Error reading message type: " << strerror(errno)
-					<< std::endl;
-		}
-		close(socket_fd);
-		return NULL;
-	}
+// ---------------- Text render (unchanged logic, minor fix for attrib program) ----------------
+void print_string(float x, float y, const char* text, float r, float g, float b, float size) {
+    (void)r; (void)g; (void)b; // shader is constant color in this example
+    char inputBuffer[2000] = { 0 };
+    GLfloat triangleBuffer[2000] = { 0 };
+    stb_easy_font_print(0, 0, (char*)text, NULL, inputBuffer, sizeof(inputBuffer));
 
-	// Read padding (1 byte) - unused
-	char padding[1];
-	if (!recv(socket_fd, padding, 1, MSG_WAITALL)) {
-		if (errno == EWOULDBLOCK || errno == EAGAIN) {
-			std::cerr << "Receive timeout occurred while reading padding"
-					<< std::endl;
-		} else {
-			std::cerr << "Error reading padding: " << strerror(errno)
-					<< std::endl;
-		}
-		close(socket_fd);
-		return NULL;
-	}
+    float ndcMovementX = (2.0f * x) / windowWidth;
+    float ndcMovementY = (2.0f * y) / windowHeight;
 
-	// Read number-of-rectangles (2 bytes)
-	char numberOfRectangles[2];
-	if (!recv(socket_fd, numberOfRectangles, 2, MSG_WAITALL)) {
-		if (errno == EWOULDBLOCK || errno == EAGAIN) {
-			std::cerr
-					<< "Receive timeout occurred while reading number of rectangles"
-					<< std::endl;
-		} else {
-			std::cerr << "Error reading number of rectangles: " << strerror(
-					errno) << std::endl;
-		}
-		close(socket_fd);
-		return NULL;
-	}
+    int triangleIndex = 0;
+    for (int i = 0; i < (int)(sizeof(inputBuffer) / sizeof(GLfloat)); i += 8) {
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[i * sizeof(GLfloat)]) / size + ndcMovementX;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 1) * sizeof(GLfloat)]) / size * -1 + ndcMovementY;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 2) * sizeof(GLfloat)]) / size + ndcMovementX;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 3) * sizeof(GLfloat)]) / size * -1 + ndcMovementY;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 4) * sizeof(GLfloat)]) / size + ndcMovementX;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 5) * sizeof(GLfloat)]) / size * -1 + ndcMovementY;
 
-	// Calculate the total size of the message
-	int totalLoadedSize = 0; // message-type + padding + number-of-rectangles
-	char* finalFrameBuffer = (char*) malloc(1);
-	int offset = 0;
-	int ret = 0;
-	// Now parse each rectangle
-	for (int i = 0; i < byteArrayToInt16(numberOfRectangles); i++) {
-		// Read rectangle header
-		char xPosition[2];
-		char yPosition[2];
-		char width[2];
-		char height[2];
-		char encodingType[4]; // S32
-		char compressedDataSize[4]; // S32
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[i * sizeof(GLfloat)]) / size + ndcMovementX;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 1) * sizeof(GLfloat)]) / size * -1 + ndcMovementY;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 4) * sizeof(GLfloat)]) / size + ndcMovementX;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 5) * sizeof(GLfloat)]) / size * -1 + ndcMovementY;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 6) * sizeof(GLfloat)]) / size + ndcMovementX;
+        triangleBuffer[triangleIndex++] = *reinterpret_cast<GLfloat*>(&inputBuffer[(i + 7) * sizeof(GLfloat)]) / size * -1 + ndcMovementY;
+    }
 
-		if (!recv(socket_fd, xPosition, 2, MSG_WAITALL) || !recv(socket_fd,
-				yPosition, 2, MSG_WAITALL) || !recv(socket_fd, width, 2,
-				MSG_WAITALL) || !recv(socket_fd, height, 2, MSG_WAITALL)
-				|| !recv(socket_fd, encodingType, 4, MSG_WAITALL)) {
-			fprintf(stderr, "Error reading rectangle header\n");
-			return NULL;
-		}
+    glUseProgram(programObjectTextRender);
 
-		*frameBufferWidth = byteArrayToInt16(width);
-		*frameBufferHeight = byteArrayToInt16(height);
-		*finalHeight = *finalHeight + *frameBufferHeight;
-		if (encodingType[3] == '\x6') // ZLIB encoding
-		{
-			// Read zlib compressed data size with timeout handling
-			if (!recv(socket_fd, compressedDataSize, 4, MSG_WAITALL)) {
-				if (errno == EWOULDBLOCK || errno == EAGAIN) {
-					std::cerr
-							<< "Receive timeout occurred while reading zlib compressed data size"
-							<< std::endl;
-				} else {
-					std::cerr << "Zlib compressed data size not found: "
-							<< strerror(errno) << std::endl;
-				}
-				close(socket_fd);
-				return NULL;
-			}
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(triangleBuffer), triangleBuffer, GL_STATIC_DRAW);
 
-			char* compressedData = (char*) malloc(byteArrayToInt32(
-					compressedDataSize));
+    // FIX: query attribute from the TEXT program, not the VNC program
+    GLint positionAttribute = glGetAttribLocation(programObjectTextRender, "position");
+    glEnableVertexAttribArray(positionAttribute);
+    glVertexAttribPointer(positionAttribute, 2, GL_FLOAT, GL_FALSE, 0, NULL);
 
-			int compresedDataReceivedSize = recv(socket_fd, compressedData,
-					byteArrayToInt32(compressedDataSize), MSG_WAITALL);
-			if (compresedDataReceivedSize < 0) {
-				if (errno == EWOULDBLOCK || errno == EAGAIN) {
-					std::cerr
-							<< "Receive timeout occurred while receiving compressed data"
-							<< std::endl;
-				} else {
-					perror("Error receiving compressed data");
-				}
-				free(compressedData);
-				close(socket_fd);
-				return NULL;
-			}
+    glDrawArrays(GL_TRIANGLES, 0, triangleIndex);
 
-			// Allocate memory for decompressed data (assuming it's at most the same size as compressed)
-			char* decompressedData = (char*) malloc(*frameBufferWidth
-					* *frameBufferHeight * 4);
-			if (!decompressedData) {
-				perror("Error allocating memory for decompressed data");
-				free(decompressedData);
-				close(socket_fd);
-				return NULL;
-			}
-
-			// Resize finalFrameBuffer to accommodate the appended data
-			totalLoadedSize = totalLoadedSize + (*frameBufferWidth
-					* *frameBufferHeight * 4);
-			finalFrameBuffer = (char*) realloc(finalFrameBuffer,
-					totalLoadedSize);
-
-			// Decompress the data
-			strm.avail_in = compresedDataReceivedSize;
-			strm.next_in = (Bytef*) compressedData;
-			strm.avail_out = *frameBufferWidth * *frameBufferHeight * 4; // Use the actual size of the decompressed data
-			strm.next_out = (Bytef*) decompressedData;
-
-			ret = inflate(&strm, Z_NO_FLUSH);
-
-			if (ret < 0 && ret != Z_BUF_ERROR) {
-				fprintf(stderr, "Error: Failed to decompress zlib data: %s\n",
-						strm.msg);
-				inflateEnd(&strm);
-				free(decompressedData);
-				free(compressedData);
-				close(socket_fd);
-				return NULL;
-			}
-
-			memcpy(finalFrameBuffer + offset, decompressedData,
-					*frameBufferWidth * *frameBufferHeight * 4);
-			offset = offset + (*frameBufferWidth * *frameBufferHeight * 4);
-			// Free memory allocated for framebufferUpdateRectangle
-			free(compressedData);
-			free(decompressedData);
-		}
-	}
-	return finalFrameBuffer;
-}
-void print_string(float x, float y, const char* text, float r, float g,
-		float b, float size) {
-	char inputBuffer[2000] = { 0 }; // ~20s chars
-	GLfloat triangleBuffer[2000] = { 0 };
-	int number = stb_easy_font_print(0, 0, text, NULL, inputBuffer,
-			sizeof(inputBuffer));
-
-	// calculate movement inside viewport
-	float ndcMovementX = (2.0f * x) / windowWidth;
-	float ndcMovementY = (2.0f * y) / windowHeight;
-
-	int triangleIndex = 0; // Index to keep track of the current position in the triangleBuffer
-	// Convert each quad into two triangles and also apply size and offset to draw it to correct place
-	for (int i = 0; i < sizeof(inputBuffer) / sizeof(GLfloat); i += 8) {
-		// Triangle 1
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[i * sizeof(GLfloat)])
-						/ size + ndcMovementX;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 1)
-						* sizeof(GLfloat)]) / size * -1 + ndcMovementY;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 2)
-						* sizeof(GLfloat)]) / size + +ndcMovementX;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 3)
-						* sizeof(GLfloat)]) / size * -1 + ndcMovementY;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 4)
-						* sizeof(GLfloat)]) / size + ndcMovementX;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 5)
-						* sizeof(GLfloat)]) / size * -1 + ndcMovementY;
-
-		//// Triangle 2
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[i * sizeof(GLfloat)])
-						/ size + ndcMovementX;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 1)
-						* sizeof(GLfloat)]) / size * -1 + ndcMovementY;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 4)
-						* sizeof(GLfloat)]) / size + ndcMovementX;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 5)
-						* sizeof(GLfloat)]) / size * -1 + ndcMovementY;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 6)
-						* sizeof(GLfloat)]) / size + ndcMovementX;
-		triangleBuffer[triangleIndex++]
-				= *reinterpret_cast<GLfloat*> (&inputBuffer[(i + 7)
-						* sizeof(GLfloat)]) / size * -1 + ndcMovementY;
-
-	}
-
-	glUseProgram(programObjectTextRender);
-	GLuint vbo;
-	glGenBuffers(1, &vbo);
-	glBindBuffer(GL_ARRAY_BUFFER, vbo);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(triangleBuffer), triangleBuffer,
-			GL_STATIC_DRAW);
-
-	// Specify the layout of the vertex data
-	GLint positionAttribute = glGetAttribLocation(programObject, "position");
-	glEnableVertexAttribArray(positionAttribute);
-	glVertexAttribPointer(positionAttribute, 2, GL_FLOAT, GL_FALSE, 0, NULL);
-	// glEnableVertexAttribArray(0);
-
-	// Render the triangle
-	glDrawArrays(GL_TRIANGLES, 0, triangleIndex);
-
-	glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &vbo);
 }
 
-void print_string_center(float y, const char* text, float r, float g, float b,
-		float size) {
-	print_string(-stb_easy_font_width(text) * (size / 200), y, text, r, g, b,
-			size);
-}
-
-// Helper function to parse a line for GLfloat arrays
+// ---------------- Config file helpers (unchanged) ----------------
 void parseLineArray(char *line, const char *key, GLfloat *dest, int count) {
     if (strncmp(line, key, strlen(key)) == 0) {
         char *values = strchr(line, '=');
         if (values) {
-            values++; // Skip '='
-            for (int i = 0; i < count; i++) {
-                dest[i] = strtof(values, &values); // Parse floats
-            }
+            values++;
+            for (int i = 0; i < count; i++) dest[i] = strtof(values, &values);
         }
     }
 }
-
-// Helper function to parse a line for integers
 void parseLineInt(char *line, const char *key, int *dest) {
     if (strncmp(line, key, strlen(key)) == 0) {
         char *value = strchr(line, '=');
-        if (value) {
-            *dest = atoi(value + 1); // Parse integer
-        }
+        if (value) *dest = atoi(value + 1);
     }
 }
-
-// Function to load the configuration file
 void loadConfig(const char *filename) {
-	FILE *file = fopen(filename, "r");
-	if (!file) {
-		printf("Config file not found. Using defaults.\n");
-		return;
-	}
-
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        printf("Config file not found. Using defaults.\n");
+        return;
+    }
     char line[256];
     while (fgets(line, sizeof(line), file)) {
         parseLineArray(line, "landscapeVertices", landscapeVertices, 12);
@@ -589,11 +390,8 @@ void loadConfig(const char *filename) {
         parseLineInt(line, "windowWidth", &windowWidth);
         parseLineInt(line, "windowHeight", &windowHeight);
     }
-
-	fclose(file);
+    fclose(file);
 }
-
-// Function to print GLfloat arrays
 void printArray(const char *label, GLfloat *array, int count, int elementsPerLine) {
     printf("%s:\n", label);
     for (int i = 0; i < count; i++) {
@@ -603,16 +401,137 @@ void printArray(const char *label, GLfloat *array, int count, int elementsPerLin
     printf("\n");
 }
 
-// MAIN SECTION IS DIFFERENT ON QNX
-int main(int argc, char* argv[]) {
+// ---------------- VNC framebuffer update parser (PIPELINED) ----------------
+char* parseFramebufferUpdate_pipelined(
+    int socket_fd,
+    int* frameBufferWidth,
+    int* frameBufferHeight,
+    z_stream* strm,
+    int* finalHeight,
+    FrameTimings* timings)
+{
+    uint64_t parseStart = now_us();
 
-	printf("QNX MOST VNC render 0.1.0 \n");
-	printf("Loading libdisplayinit.so \n");
-	printf("Loading config.txt \n");
-    // Load config
+    // Server->client message header: type(1), pad(1), rectcount(2)
+    char msgHdr[4];
+    if (recv_exact(socket_fd, msgHdr, 4, timings) != 0) {
+        return NULL;
+    }
+
+    unsigned char messageType = (unsigned char)msgHdr[0];
+    int rectCount = byteArrayToInt16(msgHdr + 2);
+
+    // --- PIPELINING: request NEXT update ASAP (after we know this is a framebuffer update) ---
+    if (messageType == 0) {
+        // best-effort; if it fails, we still try to decode current frame
+        (void)send(socket_fd, FRAMEBUFFER_UPDATE_REQUEST, sizeof(FRAMEBUFFER_UPDATE_REQUEST), 0);
+    }
+
+    int totalLoadedSize = 0;
+    char* finalFrameBuffer = (char*)malloc(1);
+    if (!finalFrameBuffer) return NULL;
+
+    int offset = 0;
+
+    for (int i = 0; i < rectCount; i++) {
+        // Rect header: x(2), y(2), w(2), h(2), encoding(4)
+        char rectHdr[12];
+        if (recv_exact(socket_fd, rectHdr, 12, timings) != 0) {
+            free(finalFrameBuffer);
+            return NULL;
+        }
+
+        int w = byteArrayToInt16(rectHdr + 4);
+        int h = byteArrayToInt16(rectHdr + 6);
+        int32_t encoding = byteArrayToInt32(rectHdr + 8);
+
+        *frameBufferWidth = w;
+        *frameBufferHeight = h;
+        *finalHeight += h;
+
+        if (encoding == 6) { // ZLIB encoding
+            char sizeBuf[4];
+            if (recv_exact(socket_fd, sizeBuf, 4, timings) != 0) {
+                free(finalFrameBuffer);
+                return NULL;
+            }
+
+            int compressedSize = byteArrayToInt32(sizeBuf);
+            if (compressedSize <= 0) {
+                free(finalFrameBuffer);
+                return NULL;
+            }
+
+            char* compressedData = (char*)malloc((size_t)compressedSize);
+            if (!compressedData) {
+                free(finalFrameBuffer);
+                return NULL;
+            }
+
+            if (recv_exact(socket_fd, compressedData, (size_t)compressedSize, timings) != 0) {
+                free(compressedData);
+                free(finalFrameBuffer);
+                return NULL;
+            }
+
+            size_t outSize = (size_t)w * (size_t)h * 4u;
+            char* decompressedData = (char*)malloc(outSize);
+            if (!decompressedData) {
+                free(compressedData);
+                free(finalFrameBuffer);
+                return NULL;
+            }
+
+            totalLoadedSize += (int)outSize;
+            char* tmp = (char*)realloc(finalFrameBuffer, (size_t)totalLoadedSize);
+            if (!tmp) {
+                free(decompressedData);
+                free(compressedData);
+                free(finalFrameBuffer);
+                return NULL;
+            }
+            finalFrameBuffer = tmp;
+
+            strm->avail_in  = (uInt)compressedSize;
+            strm->next_in   = (Bytef*)compressedData;
+            strm->avail_out = (uInt)outSize;
+            strm->next_out  = (Bytef*)decompressedData;
+
+            uint64_t infStart = now_us();
+            int ret = inflate(strm, Z_NO_FLUSH);
+            uint64_t infEnd = now_us();
+            if (timings) timings->inflate_ms += us_to_ms(infEnd - infStart);
+
+            if (ret < 0 && ret != Z_BUF_ERROR) {
+                free(decompressedData);
+                free(compressedData);
+                free(finalFrameBuffer);
+                return NULL;
+            }
+
+            memcpy(finalFrameBuffer + offset, decompressedData, outSize);
+            offset += (int)outSize;
+
+            free(decompressedData);
+            free(compressedData);
+        } else {
+            // Unsupported encoding in this minimal example
+            // You could skip/handle RAW etc. here.
+        }
+    }
+
+    uint64_t parseEnd = now_us();
+    if (timings) timings->parse_ms = us_to_ms(parseEnd - parseStart);
+    return finalFrameBuffer;
+}
+
+// ---------------- MAIN ----------------
+int main(int argc, char* argv[])
+{
+    printf("QNX MOST VNC render 0.2.x (Pipelined)\n");
+    printf("Loading config.txt\n");
     loadConfig("config.txt");
 
-    // Print loaded or default values
     printArray("Landscape vertices", landscapeVertices, 12, 3);
     printArray("Portrait vertices", portraitVertices, 12, 3);
     printArray("Landscape texture coordinates", landscapeTexCoords, 8, 2);
@@ -620,547 +539,408 @@ int main(int argc, char* argv[]) {
     printf("windowWidth = %d;\n", windowWidth);
     printf("windowHeight = %d;\n", windowHeight);
 
+    // display_init
+    void* func_handle = dlopen("libdisplayinit.so", RTLD_LAZY);
+    if (!func_handle) {
+        fprintf(stderr, "Error using libdisplayinit.so: %s\n", dlerror());
+        return 1;
+    }
 
-	void* func_handle = dlopen("libdisplayinit.so", RTLD_LAZY);
-	if (!func_handle) {
-		fprintf(stderr, "Error using libdisplayinit.so: %s\n", dlerror());
-		return 1; // Exit with error
-	}
+    void (*display_init)(int, int) = (void (*)(int, int))dlsym(func_handle, "display_init");
+    if (!display_init) {
+        fprintf(stderr, "Error loading display_init: %s\n", dlerror());
+        dlclose(func_handle);
+        return 1;
+    }
 
-	// Load the function pointer
-	void
-			(*display_init)(int, int) = (void (*)(int, int))dlsym(func_handle, "display_init");
-	if (!display_init) {
-		fprintf(
-				stderr,
-				"Error while loading libdisplayinit.so function display_init: %s\n",
-				dlerror());
-		dlclose(func_handle); // Close the handle before returning
-		return 1; // Exit with error
-	}
+    printf("Calling display_init\n");
+    display_init(0, 0);
 
-	printf("Calling method display_init from libdisplayinit.so \n");
-	// Call the function
-	display_init(0, 0); // DONE
+    dlclose(func_handle);
 
-	// Close the handle
-	if (dlclose(func_handle) != 0) {
-		fprintf(stderr, "Error while closing libdisplayinit.so handle: %s\n",
-				dlerror());
-		return 1; // Exit with error
-	}
+    // EGL init
+    printf("OpenGL ES2.0 initialization started\n");
+    eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(eglDisplay, 0, 0);
 
-	printf("OpenGL ES2.0 initialization started \n");
-	eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY); // DONE
-	eglInitialize(eglDisplay, 0, 0); // DONE
+    GLint maxSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxSize);
+    printf("Maximum OpenGL texture size supported: %d\n", maxSize);
 
-	GLint maxSize;
-	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxSize);
-	printf("Maximum OpenGL texture size supported: %d\n", maxSize);
+    EGLint config_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 1,
+        EGL_GREEN_SIZE, 1,
+        EGL_BLUE_SIZE, 1,
+        EGL_ALPHA_SIZE, 1,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
 
-	// Specify EGL configurations
-	EGLint config_attribs[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RED_SIZE,
-			1, EGL_GREEN_SIZE, 1, EGL_BLUE_SIZE, 1, EGL_ALPHA_SIZE, 1,
-			EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE };
+    EGLConfig* configs = new EGLConfig[5];
+    EGLint num_configs = 0;
+    EGLNativeWindowType windowEgl;
+    int kdWindow = 0;
 
-	EGLConfig* configs = new EGLConfig[5];
-	EGLint num_configs;
-	EGLNativeWindowType windowEgl;
-	int kdWindow;
-	if (!eglChooseConfig(eglDisplay, config_attribs, configs, 1, &num_configs)) { // DONE
-		fprintf(stderr, "Error: Failed to choose EGL configuration\n");
-		return 1; // Exit with error
-	}
-	eglConfig = configs[0];
+    if (!eglChooseConfig(eglDisplay, config_attribs, configs, 1, &num_configs)) {
+        fprintf(stderr, "Error: Failed to choose EGL configuration\n");
+        return 1;
+    }
+    eglConfig = configs[0];
 
-	void* func_handle_display_create_window = dlopen("libdisplayinit.so",
-			RTLD_LAZY);
-	if (!func_handle_display_create_window) {
-		fprintf(stderr, "Error: %s\n", dlerror());
-		return 1; // Exit with error
-	}
+    void* func_handle_display_create_window = dlopen("libdisplayinit.so", RTLD_LAZY);
+    if (!func_handle_display_create_window) {
+        fprintf(stderr, "Error: %s\n", dlerror());
+        return 1;
+    }
 
-	void (*display_create_window)(EGLDisplay, // DAT_00102f68: void* parameter
-			EGLConfig, // local_24[0]: void* parameter
-			int, // 800: void* parameter
-			int, // 0x1e0: void* parameter
-			int, // DAT_00102f0c: void* parameter
-			EGLNativeWindowType*, // &local_2c: void* parameter
-			int* // &DAT_00102f78: void* parameter
-			) = (void (*)(EGLDisplay, EGLConfig, int, int, int, EGLNativeWindowType*, int*))dlsym(func_handle_display_create_window, "display_create_window");
-	if (!display_create_window) {
-		fprintf(stderr, "Error: %s\n", dlerror());
-		dlclose(func_handle_display_create_window); // Close the handle before returning
-		return 1; // Exit with error
-	}
-	printf("libdisplayinit.so: display_create_window \n");
-	display_create_window(eglDisplay, configs[0], windowWidth, windowHeight, 3,
-			&windowEgl, &kdWindow);
+    void (*display_create_window)(EGLDisplay, EGLConfig, int, int, int, EGLNativeWindowType*, int*) =
+        (void (*)(EGLDisplay, EGLConfig, int, int, int, EGLNativeWindowType*, int*))
+        dlsym(func_handle_display_create_window, "display_create_window");
 
-	// Close the handle
-	if (dlclose(func_handle_display_create_window) != 0) {
-		fprintf(stderr, "Error: %s\n", dlerror());
-		return 1; // Exit with error
-	}
-	printf("OpenGLES: eglCreateWindowSurface \n");
-	eglSurface = eglCreateWindowSurface(eglDisplay, configs[0], windowEgl, 0);
-	if (eglSurface == EGL_NO_SURFACE) {
-		checkErrorEGL("eglCreateWindowSurface");
-		fprintf(stderr, "Create surface failed: 0x%x\n", eglSurface);
-		exit(EXIT_FAILURE);
-	}
-	eglBindAPI(EGL_OPENGL_ES_API);
+    if (!display_create_window) {
+        fprintf(stderr, "Error loading display_create_window: %s\n", dlerror());
+        dlclose(func_handle_display_create_window);
+        return 1;
+    }
 
-	const EGLint
-			context_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-	printf("OpenGLES: eglCreateContext \n");
-	eglContext = eglCreateContext(eglDisplay, configs[0], EGL_NO_CONTEXT,
-			context_attribs);
-	checkErrorEGL("eglCreateContext");
-	if (eglContext == EGL_NO_CONTEXT) {
-		std::cerr << "Failed to create EGL context" << std::endl;
-		return EXIT_FAILURE;
-	}
+    printf("display_create_window\n");
+    display_create_window(eglDisplay, configs[0], windowWidth, windowHeight, 3, &windowEgl, &kdWindow);
+    dlclose(func_handle_display_create_window);
 
-	EGLBoolean madeCurrent = eglMakeCurrent(eglDisplay, eglSurface, eglSurface,
-			eglContext);
-	if (madeCurrent == EGL_FALSE) {
-		std::cerr << "Failed to make EGL context current" << std::endl;
-		return EXIT_FAILURE;
-	}
+    printf("eglCreateWindowSurface\n");
+    eglSurface = eglCreateWindowSurface(eglDisplay, configs[0], windowEgl, 0);
+    if (eglSurface == EGL_NO_SURFACE) {
+        checkErrorEGL("eglCreateWindowSurface");
+        fprintf(stderr, "Create surface failed\n");
+        exit(EXIT_FAILURE);
+    }
 
-	// THIS SECTIONS IS THE SAME ON QNX AND WINDOWS
-	// Initialize OpenGL ES
-	Init();
-	while (true) {
-		printf("Main loop executed \n");
-		execute_final_commands();
-		int sockfd;
-		fd_set write_fds;
-		int result;
-		int so_error;
-		socklen_t len = sizeof(so_error);
-		struct sockaddr_in serv_addr;
+    eglBindAPI(EGL_OPENGL_ES_API);
+    const EGLint context_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
 
-		int keepalive = 1; // Enable keepalive
-		int keepidle = 2; // Idle time before sending the first keepalive probe (in seconds)
+    printf("eglCreateContext\n");
+    eglContext = eglCreateContext(eglDisplay, configs[0], EGL_NO_CONTEXT, context_attribs);
+    if (eglContext == EGL_NO_CONTEXT) {
+        checkErrorEGL("eglCreateContext");
+        std::cerr << "Failed to create EGL context\n";
+        return EXIT_FAILURE;
+    }
 
-		// Create socket
-		sockfd = socket(AF_INET, SOCK_STREAM, 0);
-		if (sockfd < 0) {
-			perror("Error opening socket");
-			close(sockfd);
-			continue;
-		}
+    if (eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext) == EGL_FALSE) {
+        std::cerr << "Failed to make EGL context current\n";
+        return EXIT_FAILURE;
+    }
 
-		int mib[4];
-		int ival = 0;
+    Init();
 
-		mib[0] = CTL_NET;
-		mib[1] = AF_INET;
-		mib[2] = IPPROTO_TCP;
-		mib[3] = TCPCTL_KEEPCNT;
-		ival = 3;
-		sysctl(mib, 4, NULL, NULL, &ival, sizeof(ival));
+    // -------- Main reconnect loop --------
+    for (;;) {
+        printf("Main loop executed\n");
+        execute_final_commands();
 
-		mib[0] = CTL_NET;
-		mib[1] = AF_INET;
-		mib[2] = IPPROTO_TCP;
-		mib[3] = TCPCTL_KEEPINTVL;
-		ival = 2;
-		sysctl(mib, 4, NULL, NULL, &ival, sizeof(ival));
+        int sockfd = -1;
+        fd_set write_fds;
+        int result = 0;
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        struct sockaddr_in serv_addr;
 
-		// Enable TCP keepalive
-		if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive,
-				sizeof(keepalive)) < 0) {
-			perror("setsockopt SO_KEEPALIVE");
-			close(sockfd);
-			continue;
-		}
+        int keepalive = 1;
+        int keepidle  = 2;
 
-		// Set the time (in seconds) the connection needs to remain idle before TCP starts sending keepalive probes
-		if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle,
-				sizeof(keepidle)) < 0) {
-			perror("setsockopt TCP_KEEPIDLE");
-			close(sockfd);
-			continue;
-		}
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) {
+            perror("Error opening socket");
+            usleep(200000);
+            continue;
+        }
 
-		printf("TCP keepalive enabled and configured on the socket.\n");
+        int mib[4];
+        int ival = 0;
 
-		// Set socket to non-blocking mode
-		int flags = fcntl(sockfd, F_GETFL, 0);
-		if (flags < 0) {
-			perror("fcntl F_GETFL");
-			close(sockfd);
-			continue;
-		}
-		if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-			perror("fcntl F_SETFL");
-			close(sockfd);
-			continue;
-		}
+        mib[0] = CTL_NET; mib[1] = AF_INET; mib[2] = IPPROTO_TCP; mib[3] = TCPCTL_KEEPCNT;
+        ival = 3;
+        sysctl(mib, 4, NULL, NULL, &ival, sizeof(ival));
 
-		// Initialize socket structure
-		memset((char*) &serv_addr, 0, sizeof(serv_addr));
-		serv_addr.sin_family = AF_INET;
-		if (argc > 1) {
-			// Use IP address from command line argument
-			serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
-		} else {
-			// Fallback to default IP address if no argument is provided
-			serv_addr.sin_addr.s_addr = inet_addr(VNC_SERVER_IP_ADDRESS);
-		}
-		serv_addr.sin_port = htons(VNC_SERVER_PORT);
+        mib[0] = CTL_NET; mib[1] = AF_INET; mib[2] = IPPROTO_TCP; mib[3] = TCPCTL_KEEPINTVL;
+        ival = 2;
+        sysctl(mib, 4, NULL, NULL, &ival, sizeof(ival));
 
-		struct timeval timeout;
-		timeout.tv_sec = 10; // 10 seconds timeout read/write
-		timeout.tv_usec = 0;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
+            perror("setsockopt SO_KEEPALIVE");
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
 
-		// Set receive timeout
-		if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &timeout,
-				sizeof(timeout)) < 0) {
-			perror("Set receive timeout failed");
-			close(sockfd);
-			continue;
-		}
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle, sizeof(keepidle)) < 0) {
+            perror("setsockopt TCP_KEEPALIVE");
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
 
-		// Set send timeout
-		if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*) &timeout,
-				sizeof(timeout)) < 0) {
-			perror("Set send timeout failed");
-			close(sockfd);
-			continue;
-		}
+        int flags = fcntl(sockfd, F_GETFL, 0);
+        if (flags < 0) {
+            perror("fcntl F_GETFL");
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
+        if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            perror("fcntl F_SETFL");
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
 
-		result = connect(sockfd, (struct sockaddr*) &serv_addr,
-				sizeof(serv_addr));
-		if (result < 0 && errno != EINPROGRESS) {
-			perror("Error connecting to server");
-			usleep(200000); // Sleep for 200 milliseconds (200,000 microseconds)
-			close(sockfd);
-			continue;
-		}
+        memset((char*)&serv_addr, 0, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        if (argc > 1) serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+        else          serv_addr.sin_addr.s_addr = inet_addr(VNC_SERVER_IP_ADDRESS);
+        serv_addr.sin_port = htons(VNC_SERVER_PORT);
 
-		// Initialize file descriptor set
-		FD_ZERO(&write_fds);
-		FD_SET(sockfd, &write_fds);
+        struct timeval timeout;
+        timeout.tv_sec = 10;
+        timeout.tv_usec = 0;
 
-		// Set timeout value
-		timeout.tv_sec = 5;
-		timeout.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
-		// Wait for the socket to be writable (connection established)
-		result = select(sockfd + 1, NULL, &write_fds, NULL, &timeout);
-		if (result < 0) {
-			perror("select failed");
-			close(sockfd);
-			usleep(200000); // Sleep for 200 milliseconds (200,000 microseconds)
-			continue;
-		} else if (result == 0) {
-			printf("Connection timed out\n");
-			close(sockfd);
-			usleep(200000); // Sleep for 200 milliseconds (200,000 microseconds)
-			continue;
-		} else {
-			// Check if the connection was successful
-			if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) {
-				perror("getsockopt");
-				close(sockfd);
-				usleep(200000); // Sleep for 200 milliseconds (200,000 microseconds)
-				continue;
-			}
-			if (so_error == 0) {
-				printf("Connected to the server: %s\n", inet_ntoa(
-						serv_addr.sin_addr));
-			} else {
-				printf("Connection failed: %s\n", strerror(so_error));
-				usleep(200000); // Sleep for 200 milliseconds (200,000 microseconds)
-				close(sockfd);
-				continue;
-			}
-		}
+        result = connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+        if (result < 0 && errno != EINPROGRESS) {
+            perror("Error connecting to server");
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
 
-		// Reset socket to blocking mode
-		if (fcntl(sockfd, F_SETFL, flags) < 0) {
-			perror("fcntl F_SETFL");
-			usleep(200000); // Sleep for 200 milliseconds (200,000 microseconds)
-			close(sockfd);
-			continue;
-		}
+        FD_ZERO(&write_fds);
+        FD_SET(sockfd, &write_fds);
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
 
-		if (sockfd != NULL) {
-			// we have connection so swap to different view
-			execute_initial_commands();
-		}
+        result = select(sockfd + 1, NULL, &write_fds, NULL, &timeout);
+        if (result <= 0) {
+            if (result < 0) perror("select failed");
+            else printf("Connection timed out\n");
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
 
-		// Receive server initialization message
-		char serverInitMsg[12];
-		int bytesReceived = recv(sockfd, serverInitMsg, sizeof(serverInitMsg),
-				MSG_WAITALL);
-		if (bytesReceived < 0) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr << "Receive timeout occurred" << std::endl;
-			} else {
-				std::cerr << "Error receiving server initialization message: "
-						<< strerror(errno) << std::endl;
-			}
-			close(sockfd);
-			continue;
-		} else if (bytesReceived == 0) {
-			std::cerr << "Connection closed by peer" << std::endl;
-			close(sockfd);
-			continue;
-		}
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0) {
+            printf("Connection failed: %s\n", strerror(so_error));
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
 
-		// Send client protocol version message with timeout handling
-		if (send(sockfd, PROTOCOL_VERSION, strlen(PROTOCOL_VERSION), 0) < 0) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr << "Send timeout occurred" << std::endl;
-			} else {
-				std::cerr << "Error sending client initialization message: "
-						<< strerror(errno) << std::endl;
-			}
-			close(sockfd);
-			continue;
-		}
-		// Security handshake
-		char securityHandshake[4];
-		ssize_t bytesReceivedSecurity = recv(sockfd, securityHandshake,
-				sizeof(securityHandshake), 0);
-		if (bytesReceivedSecurity < 0) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr << "Receive timeout occurred" << std::endl;
-			} else {
-				std::cerr << "Error reading security handshake: " << strerror(
-						errno) << std::endl;
-			}
-			close(sockfd);
-			continue;
-		} else if (bytesReceivedSecurity == 0) {
-			std::cerr << "Connection closed by peer" << std::endl;
-			close(sockfd);
-			continue;
-		}
+        // back to blocking mode
+        if (fcntl(sockfd, F_SETFL, flags) < 0) {
+            perror("fcntl F_SETFL");
+            close(sockfd);
+            usleep(200000);
+            continue;
+        }
 
-		if (send(sockfd, "\x01", 1, 0) < 0) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr << "Send timeout occurred" << std::endl;
-			} else {
-				std::cerr << "Error sending client init message: " << strerror(
-						errno) << std::endl;
-			}
-			close(sockfd);
-			continue;
-		}
+        execute_initial_commands();
 
-		// Read framebuffer width and height
-		char framebufferWidth[2];
-		char framebufferHeight[2];
+        // ---- VNC handshake (same behavior as your original) ----
+        char serverInitMsg[12];
+        if (recv_exact(sockfd, serverInitMsg, sizeof(serverInitMsg), NULL) != 0) {
+            perror("recv serverInitMsg");
+            close(sockfd);
+            continue;
+        }
 
-		ssize_t bytesReceivedFrameBuffer = recv(sockfd, framebufferWidth,
-				sizeof(framebufferWidth), 0);
-		if (bytesReceivedFrameBuffer < 0) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr
-						<< "Receive timeout occurred while reading framebuffer width"
-						<< std::endl;
-			} else {
-				std::cerr << "Error reading framebuffer width: " << strerror(
-						errno) << std::endl;
-			}
-			close(sockfd);
-			continue;
-		} else if (bytesReceivedFrameBuffer == 0) {
-			std::cerr
-					<< "Connection closed by peer while reading framebuffer width"
-					<< std::endl;
-			close(sockfd);
-			continue;
-		}
+        if (send(sockfd, PROTOCOL_VERSION, strlen(PROTOCOL_VERSION), 0) < 0) {
+            perror("send PROTOCOL_VERSION");
+            close(sockfd);
+            continue;
+        }
 
-		bytesReceivedFrameBuffer = recv(sockfd, framebufferHeight,
-				sizeof(framebufferHeight), 0);
-		if (bytesReceivedFrameBuffer < 0) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr
-						<< "Receive timeout occurred while reading framebuffer height"
-						<< std::endl;
-			} else {
-				std::cerr << "Error reading framebuffer height: " << strerror(
-						errno) << std::endl;
-			}
-			close(sockfd);
-			continue;
-		} else if (bytesReceivedFrameBuffer == 0) {
-			std::cerr
-					<< "Connection closed by peer while reading framebuffer height"
-					<< std::endl;
-			close(sockfd);
-			continue;
-		}
+        char securityHandshake[4];
+        if (recv(sockfd, securityHandshake, sizeof(securityHandshake), 0) <= 0) {
+            perror("recv securityHandshake");
+            close(sockfd);
+            continue;
+        }
 
-		// Read pixel format and name length
-		char pixelFormat[16];
-		char nameLength[4];
+        if (send(sockfd, "\x01", 1, 0) < 0) {
+            perror("send ClientInit");
+            close(sockfd);
+            continue;
+        }
 
-		if (!recv(sockfd, pixelFormat, sizeof(pixelFormat), MSG_WAITALL)
-				|| !recv(sockfd, nameLength, sizeof(nameLength), MSG_WAITALL)) {
-			fprintf(stderr, "Error reading pixel format or name length\n");
-			close(sockfd);
-			continue;
-		}
+        // Read framebuffer w/h (2+2), then pixel format(16) + name length(4) + name(nameLen)
+        char fbWb[2], fbHb[2];
+        if (recv_exact(sockfd, fbWb, 2, NULL) != 0 || recv_exact(sockfd, fbHb, 2, NULL) != 0) {
+            perror("recv fb size");
+            close(sockfd);
+            continue;
+        }
 
-		uint32_t nameLengthInt = (nameLength[0] << 24) | (nameLength[1] << 16)
-				| (nameLength[2] << 8) | nameLength[3];
+        char pixelFormat[16];
+        char nameLength[4];
+        if (recv_exact(sockfd, pixelFormat, 16, NULL) != 0 || recv_exact(sockfd, nameLength, 4, NULL) != 0) {
+            perror("recv pixelFormat/nameLength");
+            close(sockfd);
+            continue;
+        }
 
-		// Read server name
-		char name[32];
-		if (!recv(sockfd, name, nameLengthInt, MSG_WAITALL)) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr
-						<< "Receive timeout occurred while reading server name"
-						<< std::endl;
-			} else {
-				std::cerr << "Error reading server name: " << strerror(errno)
-						<< std::endl;
-			}
-			close(sockfd);
-			continue;
-		}
+        uint32_t nameLengthInt =
+            ((uint32_t)(unsigned char)nameLength[0] << 24) |
+            ((uint32_t)(unsigned char)nameLength[1] << 16) |
+            ((uint32_t)(unsigned char)nameLength[2] << 8)  |
+            ((uint32_t)(unsigned char)nameLength[3]);
 
-		// Send encoding update requests
-		if (send(sockfd, ZLIB_ENCODING, sizeof(ZLIB_ENCODING), 0) < 0 || send(
-				sockfd, FRAMEBUFFER_UPDATE_REQUEST,
-				sizeof(FRAMEBUFFER_UPDATE_REQUEST), 0) < 0) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				std::cerr
-						<< "Send timeout occurred while sending framebuffer update request"
-						<< std::endl;
-			} else {
-				std::cerr << "Error sending framebuffer update request: "
-						<< strerror(errno) << std::endl;
-			}
-			close(sockfd);
-			continue;
-		}
-		int framebufferWidthInt = 0;
-		int framebufferHeightInt = 0;
-		int finalHeight = 0;
+        if (nameLengthInt > 0) {
+            char* name = (char*)malloc(nameLengthInt + 1);
+            if (!name) { close(sockfd); continue; }
+            if (recv_exact(sockfd, name, nameLengthInt, NULL) != 0) {
+                free(name);
+                perror("recv server name");
+                close(sockfd);
+                continue;
+            }
+            name[nameLengthInt] = 0;
+            // printf("Server name: %s\n", name);
+            free(name);
+        }
 
-		int frameCount = 0;
-		double fps = 0.0;
-		time_t startTime = time(NULL);
+        // Set encodings + initial update request
+        if (send(sockfd, ZLIB_ENCODING, sizeof(ZLIB_ENCODING), 0) < 0) {
+            perror("send ZLIB_ENCODING");
+            close(sockfd);
+            continue;
+        }
+        if (send(sockfd, FRAMEBUFFER_UPDATE_REQUEST, sizeof(FRAMEBUFFER_UPDATE_REQUEST), 0) < 0) {
+            perror("send initial FRAMEBUFFER_UPDATE_REQUEST");
+            close(sockfd);
+            continue;
+        }
 
-		GLuint textureID;
-		glGenTextures(1, &textureID);
-		glBindTexture(GL_TEXTURE_2D, textureID);
+        // ---- GL texture init ----
+        GLuint textureID;
+        glGenTextures(1, &textureID);
+        glBindTexture(GL_TEXTURE_2D, textureID);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-		// Set texture parameters (optional)
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // ---- zlib stream (persistent across frames) ----
+        z_stream strm;
+        memset(&strm, 0, sizeof(strm));
+        if (inflateInit(&strm) != Z_OK) {
+            fprintf(stderr, "inflateInit failed\n");
+            close(sockfd);
+            glDeleteTextures(1, &textureID);
+            continue;
+        }
 
-		// Set texture wrapping mode (optional)
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		z_stream strm;
-		strm.zalloc = Z_NULL;
-		strm.zfree = Z_NULL;
-		strm.opaque = Z_NULL;
+        int framebufferWidthInt = 0;
+        int framebufferHeightInt = 0;
+        int finalHeight = 0;
 
-		int ret = inflateInit(&strm);
-		if (ret != Z_OK) {
-			fprintf(stderr, "Error: Failed to initialize zlib decompression\n");
-			continue;
-		}
+        // FPS
+        int frameCount = 0;
+        double fps = 0.0;
+        uint64_t lastFpsUs = now_us();
 
-		// Main loop
-		execute_initial_commands();
-		while (true) {
-			frameCount++;
-			char* framebufferUpdate = parseFramebufferUpdate(sockfd,
-					&framebufferWidthInt, &framebufferHeightInt, strm,
-					&finalHeight);
-			if (framebufferUpdate == NULL) {
-				close(sockfd);
-				break;
-			}
+        // ---- render loop ----
+        execute_initial_commands();
 
-			// Send framebuffer update request with timeout handling
-			if (send(sockfd, FRAMEBUFFER_UPDATE_REQUEST,
-					sizeof(FRAMEBUFFER_UPDATE_REQUEST), 0) < 0) {
-				if (errno == EWOULDBLOCK || errno == EAGAIN) {
-					std::cerr
-							<< "Send timeout occurred while sending framebuffer update request"
-							<< std::endl;
-				} else {
-					std::cerr << "Error sending framebuffer update request: "
-							<< strerror(errno) << std::endl;
-				}
-				close(sockfd);
-				break;
-			}
+        for (;;) {
+            uint64_t frameStartUs = now_us();
+            FrameTimings timings;
 
-			// Calculate elapsed time
-			time_t currentTime = time(NULL);
-			double elapsedTime = difftime(currentTime, startTime);
+            char* framebufferUpdate = parseFramebufferUpdate_pipelined(
+                sockfd,
+                &framebufferWidthInt,
+                &framebufferHeightInt,
+                &strm,
+                &finalHeight,
+                &timings);
 
-			// Calculate FPS every second
-			if (elapsedTime >= 1.0) {
-				// Calculate FPS
-				fps = frameCount / elapsedTime;
+            if (!framebufferUpdate) {
+                perror("parseFramebufferUpdate_pipelined");
+                close(sockfd);
+                break;
+            }
 
-				// Reset frame count and start time
-				frameCount = 0;
-				startTime = currentTime;
-			}
-			glClear(GL_COLOR_BUFFER_BIT); // clear all
-			glUseProgram(programObject);
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, framebufferWidthInt,
-					finalHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-					framebufferUpdate);
+            // NOTE: no send() here anymore; it's pipelined inside the parser.
 
-			// Set vertex positions
-			GLint positionAttribute = glGetAttribLocation(programObject,
-					"position");
-			if (framebufferWidthInt > finalHeight)
-				glVertexAttribPointer(positionAttribute, 3, GL_FLOAT, GL_FALSE,
-						0, landscapeVertices);
-			else
-				glVertexAttribPointer(positionAttribute, 3, GL_FLOAT, GL_FALSE,
-						0, portraitVertices);
+            // FPS update
+            frameCount++;
+            uint64_t nowUs = now_us();
+            uint64_t dtUs = nowUs - lastFpsUs;
+            if (dtUs >= 1000000ULL) {
+                fps = (double)frameCount * 1000000.0 / (double)dtUs;
+                frameCount = 0;
+                lastFpsUs = nowUs;
+            }
 
-			glEnableVertexAttribArray(positionAttribute);
+            // Render
+            glClear(GL_COLOR_BUFFER_BIT);
+            glUseProgram(programObject);
 
-			// Set texture coordinates
-			GLint texCoordAttrib = glGetAttribLocation(programObject,
-					"texCoord");
-			if (framebufferWidthInt > finalHeight)
-				glVertexAttribPointer(texCoordAttrib, 2, GL_FLOAT, GL_FALSE, 0,
-						landscapeTexCoords);
-			else
-				glVertexAttribPointer(texCoordAttrib, 2, GL_FLOAT, GL_FALSE, 0,
-						portraitTexCoords);
+            uint64_t texStartUs = now_us();
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, framebufferWidthInt, finalHeight,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, framebufferUpdate);
+            uint64_t texEndUs = now_us();
+            timings.texture_upload_ms = us_to_ms(texEndUs - texStartUs);
 
-			glEnableVertexAttribArray(texCoordAttrib);
-			finalHeight = 0;
-			// Draw quad
-			glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+            GLint positionAttribute = glGetAttribLocation(programObject, "position");
+            GLint texCoordAttrib    = glGetAttribLocation(programObject, "texCoord");
 
-			//print_string(-333, 150, readPersistanceData("s:2001:101").c_str(), 1, 1, 1, 64); // persistance data
+            if (framebufferWidthInt > finalHeight) {
+                glVertexAttribPointer(positionAttribute, 3, GL_FLOAT, GL_FALSE, 0, landscapeVertices);
+                glVertexAttribPointer(texCoordAttrib,    2, GL_FLOAT, GL_FALSE, 0, landscapeTexCoords);
+            } else {
+                glVertexAttribPointer(positionAttribute, 3, GL_FLOAT, GL_FALSE, 0, portraitVertices);
+                glVertexAttribPointer(texCoordAttrib,    2, GL_FLOAT, GL_FALSE, 0, portraitTexCoords);
+            }
 
-			eglSwapBuffers(eglDisplay, eglSurface);
-			free(framebufferUpdate); // Free the dynamically allocated memory
-		}
-		glDeleteTextures(1, &textureID);
-		execute_final_commands();
-	}
-	// Cleanup
-	eglSwapBuffers(eglDisplay, eglSurface);
-	eglDestroySurface(eglDisplay, eglSurface);
-	eglDestroyContext(eglDisplay, eglContext);
-	eglTerminate(eglDisplay);
-	execute_final_commands();
+            glEnableVertexAttribArray(positionAttribute);
+            glEnableVertexAttribArray(texCoordAttrib);
 
-	return EXIT_SUCCESS;
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+            glDisableVertexAttribArray(positionAttribute);
+            glDisableVertexAttribArray(texCoordAttrib);
+
+            // Optional on-screen stats
+            timings.total_frame_ms = us_to_ms(now_us() - frameStartUs);
+            char overlay[256];
+            snprintf(overlay, sizeof(overlay),
+                     "FPS %.1f\nFrame %.2fms\nRecv %.2fms\nInflate %.2fms\nParse %.2fms\nGPU %.2fms",
+                     fps,
+                     timings.total_frame_ms,
+                     timings.recv_ms,
+                     timings.inflate_ms,
+                     timings.parse_ms,
+                     timings.texture_upload_ms);
+            print_string(-320, 220, overlay, 1, 1, 1, 64);
+
+            eglSwapBuffers(eglDisplay, eglSurface);
+
+            finalHeight = 0;
+            free(framebufferUpdate);
+        }
+
+        inflateEnd(&strm);
+        glDeleteTextures(1, &textureID);
+        execute_final_commands();
+    }
+
+    // Cleanup (never reached with the infinite loop, kept for completeness)
+    eglSwapBuffers(eglDisplay, eglSurface);
+    eglDestroySurface(eglDisplay, eglSurface);
+    eglDestroyContext(eglDisplay, eglContext);
+    eglTerminate(eglDisplay);
+    execute_final_commands();
+    return EXIT_SUCCESS;
 }
