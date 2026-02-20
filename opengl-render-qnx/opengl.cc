@@ -166,6 +166,8 @@ GLfloat portraitTexCoords[] = {
     0.0f, 0.3f
 };
 
+GLfloat backgroundColor[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // RGBA default black
+
 // Constants for VNC protocol
 const char* PROTOCOL_VERSION = "RFB 003.003\n";
 const char FRAMEBUFFER_UPDATE_REQUEST[] = { 3, 0, 0, 0, 0, 0, (char)0xFF, (char)0xFF, (char)0xFF, (char)0xFF };
@@ -312,7 +314,12 @@ void Init() {
     glLinkProgram(programObjectTextRender);
     link_check(programObjectTextRender, "TXT PROG");
 
-    glClearColor(0.f, 0.f, 0.f, 1.f);
+	// Set clear color to black
+	glClearColor(
+    backgroundColor[0],
+    backgroundColor[1],
+    backgroundColor[2],
+    backgroundColor[3]);
 }
 
 // ---------------- Text render (unchanged logic, minor fix for attrib program) ----------------
@@ -387,6 +394,7 @@ void loadConfig(const char *filename) {
         parseLineArray(line, "portraitVertices", portraitVertices, 12);
         parseLineArray(line, "landscapeTexCoords", landscapeTexCoords, 8);
         parseLineArray(line, "portraitTexCoords", portraitTexCoords, 8);
+        parseLineArray(line, "backgroundColor", backgroundColor, 4);
         parseLineInt(line, "windowWidth", &windowWidth);
         parseLineInt(line, "windowHeight", &windowHeight);
     }
@@ -528,7 +536,7 @@ char* parseFramebufferUpdate_pipelined(
 // ---------------- MAIN ----------------
 int main(int argc, char* argv[])
 {
-    printf("QNX MOST VNC render 0.2.x (Pipelined)\n");
+    printf("QNX MOST VNC render 0.1.1 (Pipelined)\n");
     printf("Loading config.txt\n");
     loadConfig("config.txt");
 
@@ -536,6 +544,7 @@ int main(int argc, char* argv[])
     printArray("Portrait vertices", portraitVertices, 12, 3);
     printArray("Landscape texture coordinates", landscapeTexCoords, 8, 2);
     printArray("Portrait texture coordinates", portraitTexCoords, 8, 2);
+    printArray("Background color", backgroundColor, 4, 4);
     printf("windowWidth = %d;\n", windowWidth);
     printf("windowHeight = %d;\n", windowHeight);
 
@@ -913,17 +922,17 @@ int main(int argc, char* argv[])
             glDisableVertexAttribArray(texCoordAttrib);
 
             // Optional on-screen stats
-            timings.total_frame_ms = us_to_ms(now_us() - frameStartUs);
-            char overlay[256];
-            snprintf(overlay, sizeof(overlay),
-                     "FPS %.1f\nFrame %.2fms\nRecv %.2fms\nInflate %.2fms\nParse %.2fms\nGPU %.2fms",
-                     fps,
-                     timings.total_frame_ms,
-                     timings.recv_ms,
-                     timings.inflate_ms,
-                     timings.parse_ms,
-                     timings.texture_upload_ms);
-            print_string(-320, 220, overlay, 1, 1, 1, 64);
+            //timings.total_frame_ms = us_to_ms(now_us() - frameStartUs);
+            //char overlay[256];
+            //snprintf(overlay, sizeof(overlay),
+            //         "FPS %.1f\nFrame %.2fms\nRecv %.2fms\nInflate %.2fms\nParse %.2fms\nGPU %.2fms",
+            //         fps,
+            //         timings.total_frame_ms,
+            //         timings.recv_ms,
+            //         timings.inflate_ms,
+            //         timings.parse_ms,
+            //         timings.texture_upload_ms);
+            //print_string(-320, 220, overlay, 1, 1, 1, 64);
 
             eglSwapBuffers(eglDisplay, eglSurface);
 
